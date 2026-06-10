@@ -47,3 +47,4 @@ logs/
 *.pth
 *.npz
 __pycache__/
+.keops_cache
