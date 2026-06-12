@@ -1184,6 +1184,96 @@ def draw_crossfreq_spatial_block(
     if title:
         sub.suptitle(title, fontsize=10.5, fontweight="bold", y=0.98)
 
+def make_crossfreq_spatial_panels(
+    out_dir: str | Path,
+    xy: np.ndarray,
+    basis: VizGraphBasis,
+    fields_gt_repr: np.ndarray,
+    fields_ffm_repr: np.ndarray,
+    Q_gt: np.ndarray,
+    Q_ffm: np.ndarray,
+    names: Sequence[str],
+    pairs: Sequence[Tuple[int, int]],
+    cfg: Optional[VizConfig] = None,
+    prefix: str = "cross_spectral_coherence",
+    stacked: bool = True,
+    top_k_bandpairs: int = 4,
+    mode: str = "strongest_gt",
+) -> Dict[str, Path]:
+    """
+    Save cross-frequency spatial panels for many field pairs.
+
+    - one standalone figure per field pair
+    - optionally one vertically stacked multipair figure
+    """
+    cfg = cfg or VizConfig()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ps.set_paper_style()
+
+    pairs = [tuple(sorted(p)) for p in pairs]
+    saved: Dict[str, Path] = {}
+
+    # One file per pair
+    for pair in pairs:
+        fig = plt.figure(figsize=(13.0, 5.8))
+        draw_crossfreq_spatial_block(
+            fig.subfigures(1, 1),
+            xy,
+            basis,
+            fields_gt_repr,
+            fields_ffm_repr,
+            Q_gt,
+            Q_ffm,
+            pair,
+            names,
+            cfg,
+            title=f"Intuitive cross-frequency spatial coupling: {pair_label(names, *pair)}",
+            top_k=top_k_bandpairs,
+            mode=mode,
+        )
+
+        p = out_dir / f"{prefix}_pair_{names[pair[0]]}_{names[pair[1]]}_crossfreq_spatial.png"
+        fig.savefig(p, dpi=cfg.dpi, bbox_inches="tight")
+        fig.savefig(p.with_suffix(".pdf"), bbox_inches="tight")
+        plt.close(fig)
+
+        key = f"crossfreq_pair_{names[pair[0]]}_{names[pair[1]]}"
+        saved[key] = p
+        saved[key + "_pdf"] = p.with_suffix(".pdf")
+
+    # Optional stacked figure containing all requested pairs
+    if stacked and len(pairs) > 1:
+        fig = plt.figure(figsize=(13.0, 5.4 * len(pairs)))
+        subs = fig.subfigures(len(pairs), 1)
+
+        for sub, pair in zip(np.atleast_1d(subs), pairs):
+            draw_crossfreq_spatial_block(
+                sub,
+                xy,
+                basis,
+                fields_gt_repr,
+                fields_ffm_repr,
+                Q_gt,
+                Q_ffm,
+                pair,
+                names,
+                cfg,
+                title=f"Intuitive cross-frequency spatial coupling: {pair_label(names, *pair)}",
+                top_k=top_k_bandpairs,
+                mode=mode,
+            )
+
+        p = out_dir / f"{prefix}_multipair_crossfreq_spatial.png"
+        fig.savefig(p, dpi=cfg.dpi, bbox_inches="tight")
+        fig.savefig(p.with_suffix(".pdf"), bbox_inches="tight")
+        plt.close(fig)
+
+        saved["multipair_crossfreq_spatial_png"] = p
+        saved["multipair_crossfreq_spatial_pdf"] = p.with_suffix(".pdf")
+
+    return saved
+
 # ---------------------------------------------------------------------------
 # Optional standalone: all-pairs coherence small multiples
 # ---------------------------------------------------------------------------
@@ -2094,6 +2184,25 @@ def main() -> None:
         names,
         pair=pair,
         cfg=cfg,
+    )
+
+    saved.update(
+        make_crossfreq_spatial_panels(
+            out_root,
+            xy,
+            basis,
+            fields_gt_repr,
+            fields_ffm_repr,
+            Q_gt,
+            Q_ffm,
+            names,
+            pairs,   # this means ALL field pairs
+            cfg=cfg,
+            prefix="cross_spectral_coherence",
+            stacked=True,
+            top_k_bandpairs=4,
+            mode="strongest_gt",
+        )
     )
 
     selected = pair or pairs[int(np.argmax(gb_gt.mean(axis=0)))]
