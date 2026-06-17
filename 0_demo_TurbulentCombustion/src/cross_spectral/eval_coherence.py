@@ -17,7 +17,6 @@ def _safe_name(name):
     """Make a string safe for filenames."""
     return str(name).replace("/", "_").replace(" ", "_").replace("→", "to")
 
-
 def _cross_spectral_coherence_band_metrics(
     fields_true,
     fields_pred,
@@ -106,13 +105,9 @@ def _cross_spectral_coherence_band_metrics(
     samefreq_energy_pred = torch.stack(samefreq_energy_pred, dim=0)
 
     # [M, C]
-    samefreq_energy_ratio = samefreq_energy_pred / (
-        samefreq_energy_true + eps
-    )
+    samefreq_energy_ratio = samefreq_energy_pred / (samefreq_energy_true + eps)
 
-    samefreq_energy_relerr = torch.abs(
-        samefreq_energy_pred - samefreq_energy_true
-    ) / (samefreq_energy_true + eps)
+    samefreq_energy_relerr = torch.abs(samefreq_energy_pred - samefreq_energy_true) / (samefreq_energy_true + eps)
 
     # ---------------------------------------------------
     # 3. Cross-frequency band energy
@@ -145,13 +140,9 @@ def _cross_spectral_coherence_band_metrics(
         crossfreq_energy_pred[:, :, p] = torch.abs(S_pred[:, :, c1, c2])
 
     # [M, M, P]
-    crossfreq_energy_ratio = crossfreq_energy_pred / (
-        crossfreq_energy_true + eps
-    )
+    crossfreq_energy_ratio = crossfreq_energy_pred / (crossfreq_energy_true + eps)
 
-    crossfreq_energy_relerr = torch.abs(
-        crossfreq_energy_pred - crossfreq_energy_true
-    ) / (crossfreq_energy_true + eps)
+    crossfreq_energy_relerr = torch.abs(crossfreq_energy_pred - crossfreq_energy_true) / (crossfreq_energy_true + eps)
 
     # Cross-frequency means off-diagonal band pairs only.
     off_diag_mask = ~torch.eye(num_bands, dtype=torch.bool, device=device)
@@ -237,6 +228,208 @@ def _cross_spectral_coherence_band_metrics(
 
     return metrics, payload
 
+def _cross_spectral_coherence_per_snapshot(
+    fields_true,
+    fields_pred,
+    U,
+    bands,
+    field_pairs=None,
+    eps: float = 1e-12,
+):
+    """
+    Per-snapshot band-energy diagnostics only.
+
+    Computes same-frequency and cross-frequency band-energy relative erros per snapshot.
+
+    Args:
+        fields_true: [B, N, C]
+        fields_pred: [B, N, C]
+        U: [N, K] graph fourier basis
+        bands: dict mapping band name -> graph frequency indices
+        field_pairs: optional list of (c1, c2). If None, uses all c1 < c2.
+        eps: numerical stability
+    
+    Returns:
+        metrics:
+    """
+
+    # ---------------------------------------------------
+    # 1. Graph Fourier Transform
+    # ---------------------------------------------------
+    gft_true = gft(fields_true, U)
+    gft_pred = gft(fields_pred, U)
+
+    device = gft_true.device
+    B, _, C = gft_true.shape
+
+    if field_pairs is None:
+        field_pairs = [(i, j) for i in range(C) for j in range(i + 1, C)]
+    
+    band_names = list(bands.keys())
+    M = len(band_names)
+    P = len(field_pairs)
+
+    # ---------------------------------------------------
+    # 2. Same-frequency band energy per snapshot
+    # ---------------------------------------------------
+    samefreq_energy_true = []
+    samefreq_energy_pred = []
+
+    for bandName in band_names:
+        band_idx = bands[bandName]
+
+        E_true_bc = compute_band_energy(gft_true, band_idx)
+        E_pred_bc = compute_band_energy(gft_pred, band_idx)
+
+        # [B, C]
+        samefreq_energy_true.append(E_true_bc)
+        samefreq_energy_pred.append(E_pred_bc)
+    
+    # [B, M, C]
+    samefreq_energy_true = torch.stack(samefreq_energy_true, dim=1)
+    samefreq_energy_pred = torch.stack(samefreq_energy_pred, dim=1)
+
+    samefreq_energy_ratio = samefreq_energy_pred / (samefreq_energy_true + eps)
+
+    samefreq_energy_relerr = torch.abs(samefreq_energy_pred - samefreq_energy_true) / (samefreq_energy_true + eps)
+
+    # [B]
+    samefreq_relerr_per_snapshot = samefreq_energy_relerr.mean(dim=(1,2))
+    
+    # ---------------------------------------------------
+    # 3. Cross-frequency band energy per snapshot
+    # ---------------------------------------------------
+    # Center band energies across batch, matching your cross-frequency
+    # covariance construction but keeping per-snapshot products instead
+    # of immediately averaging over B.
+    z_true = samefreq_energy_true - samefreq_energy_true.mean(dim=0, keepdim=True)
+    z_pred = samefreq_energy_pred - samefreq_energy_pred.mean(dim=0, keepdim=True)
+
+    crossfreq_energy_true = torch.empty(
+        (B, M, M, P),
+        device=device,
+        dtype=z_true.dtype,
+    )
+
+    crossfreq_energy_pred = torch.empty_like(crossfreq_energy_true)
+
+    for p, (c1, c2) in enumerate(field_pairs):
+        # [B, M, M]
+        true_pair = torch.einsum(
+            "bm,bn->bmn",
+            z_true[:, :, c1],
+            z_true[:, :, c2],
+        )
+
+        pred_pair = torch.einsum(
+            "bm,bn->bmn",
+            z_pred[:, :, c1],
+            z_pred[:, :, c2],
+        )
+
+        crossfreq_energy_true[:, :, :, p] = torch.abs(true_pair)
+        crossfreq_energy_pred[:, :, :, p] = torch.abs(pred_pair)
+
+    crossfreq_energy_ratio = crossfreq_energy_pred / (
+        crossfreq_energy_true + eps
+    )
+
+    crossfreq_energy_relerr = torch.abs(
+        crossfreq_energy_pred - crossfreq_energy_true
+    ) / (crossfreq_energy_true + eps)
+
+    # Cross-frequency = off-diagonal band pairs only.
+    off_diag_mask = ~torch.eye(M, dtype=torch.bool, device=device)
+
+    # [B, M*(M-1), P]
+    crossfreq_relerr_offdiag = crossfreq_energy_relerr[:, off_diag_mask, :]
+
+    # [B]
+    crossfreq_relerr_per_snapshot = crossfreq_relerr_offdiag.mean(dim=(1, 2))
+
+    # ---------------------------------------------------
+    # 4. Total error per snapshot, still not a reward
+    # ---------------------------------------------------
+    total_relerr_per_snapshot = (samefreq_relerr_per_snapshot + crossfreq_relerr_per_snapshot)
+
+    # ---------------------------------------------------
+    # 5. Scalar logging metrics
+    # ---------------------------------------------------
+    metrics = {
+        "samefreq_relerr_snapshot_mean": float(
+            samefreq_relerr_per_snapshot.mean().detach().cpu()
+        ),
+        "samefreq_relerr_snapshot_std": float(
+            samefreq_relerr_per_snapshot.std(unbiased=False).detach().cpu()
+        ),
+        "crossfreq_relerr_snapshot_mean": float(
+            crossfreq_relerr_per_snapshot.mean().detach().cpu()
+        ),
+        "crossfreq_relerr_snapshot_std": float(
+            crossfreq_relerr_per_snapshot.std(unbiased=False).detach().cpu()
+        ),
+        "total_relerr_snapshot_mean": float(
+            total_relerr_per_snapshot.mean().detach().cpu()
+        ),
+        "total_relerr_snapshot_std": float(
+            total_relerr_per_snapshot.std(unbiased=False).detach().cpu()
+        ),
+    }
+
+    # Same-frequency per-band means.
+    samefreq_relerr_band_mean = samefreq_energy_relerr.mean(dim=(0, 2))  # [M]
+
+    for m, band_name in enumerate(band_names):
+        clean = str(band_name).lower()
+        metrics[f"samefreq_relerr_{clean}_snapshot_mean"] = float(
+            samefreq_relerr_band_mean[m].detach().cpu()
+        )
+
+    # Cross-frequency per-band-pair means.
+    for i, band_i in enumerate(band_names):
+        for j, band_j in enumerate(band_names):
+            if i == j:
+                continue
+
+            key = f"{str(band_i).lower()}_to_{str(band_j).lower()}"
+
+            metrics[f"crossfreq_relerr_{key}_snapshot_mean"] = float(
+                crossfreq_energy_relerr[:, i, j, :].mean().detach().cpu()
+            )
+
+    # ---------------------------------------------------
+    # 6. Payload
+    # ---------------------------------------------------
+    payload = {
+        "band_names": np.asarray(band_names),
+        "field_pairs": np.asarray(field_pairs),
+
+        # Same-frequency per-snapshot energy, [B, M, C].
+        "samefreq_energy_true": samefreq_energy_true.detach().cpu().numpy(),
+        "samefreq_energy_pred": samefreq_energy_pred.detach().cpu().numpy(),
+        "samefreq_energy_ratio": samefreq_energy_ratio.detach().cpu().numpy(),
+        "samefreq_energy_relerr": samefreq_energy_relerr.detach().cpu().numpy(),
+
+        # Cross-frequency per-snapshot energy contribution, [B, M, M, P].
+        "crossfreq_energy_true": crossfreq_energy_true.detach().cpu().numpy(),
+        "crossfreq_energy_pred": crossfreq_energy_pred.detach().cpu().numpy(),
+        "crossfreq_energy_ratio": crossfreq_energy_ratio.detach().cpu().numpy(),
+        "crossfreq_energy_relerr": crossfreq_energy_relerr.detach().cpu().numpy(),
+
+        # Per-snapshot error pieces, [B].
+        "samefreq_relerr_per_snapshot": (
+            samefreq_relerr_per_snapshot.detach().cpu().numpy()
+        ),
+        "crossfreq_relerr_per_snapshot": (
+            crossfreq_relerr_per_snapshot.detach().cpu().numpy()
+        ),
+        "total_relerr_per_snapshot": (
+            total_relerr_per_snapshot.detach().cpu().numpy()
+        ),
+    }
+
+    return metrics, payload
+
 # Same-Frequency Band Energy Plot
 def _save_samefreq_band_energy_ratio_plot(
     band_names,
@@ -246,7 +439,7 @@ def _save_samefreq_band_energy_ratio_plot(
     field_names=None,
 ):
     """
-    Save a Linzheng-style band energy ratio plot for same-frequency bands.
+    Save a band energy ratio plot for same-frequency bands.
 
     Plots:
         E_pred[m, c] / E_GT[m, c]
@@ -306,7 +499,7 @@ def _save_crossfreq_band_energy_ratio_plot(
     unordered: bool = False,
 ):
     """
-    Save a Linzheng-style band energy ratio plot for cross-frequency bands.
+    Save a band energy ratio plot for cross-frequency bands.
 
     Plots:
         |S_pred[m, n, c1, c2]| / |S_GT[m, n, c1, c2]|
