@@ -228,7 +228,7 @@ def _cross_spectral_coherence_band_metrics(
 
     return metrics, payload
 
-def _cross_spectral_coherence_per_snapshot(
+def _cross_spectral_coherence_band_metrics_snapshot(
     fields_true,
     fields_pred,
     U,
@@ -330,13 +330,9 @@ def _cross_spectral_coherence_per_snapshot(
         crossfreq_energy_true[:, :, :, p] = torch.abs(true_pair)
         crossfreq_energy_pred[:, :, :, p] = torch.abs(pred_pair)
 
-    crossfreq_energy_ratio = crossfreq_energy_pred / (
-        crossfreq_energy_true + eps
-    )
+    crossfreq_energy_ratio = crossfreq_energy_pred / (crossfreq_energy_true + eps)
 
-    crossfreq_energy_relerr = torch.abs(
-        crossfreq_energy_pred - crossfreq_energy_true
-    ) / (crossfreq_energy_true + eps)
+    crossfreq_energy_relerr = torch.abs(crossfreq_energy_pred - crossfreq_energy_true) / (crossfreq_energy_true + eps)
 
     # Cross-frequency = off-diagonal band pairs only.
     off_diag_mask = ~torch.eye(M, dtype=torch.bool, device=device)
