@@ -1,7 +1,26 @@
+import sys
+from pathlib import Path
+
+SRC_DIR = Path(__file__).resolve().parents[1]
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.append(str(SRC_DIR))
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from pathlib import Path
+import json
+
+from helpers import (
+    TurbulentCombustionH5Dataset,
+    reconstruct_snapshot,
+)
+from model_finetune import (
+    load_pretrained_ffm,
+    load_source_config,
+)
+
+from graph import make_graph_frequency_bands
 
 from cross_spectral import (
     gft,
@@ -621,3 +640,432 @@ def save_band_energy_diagnostic_plots(
                 pair_idx=p,
                 unordered=unordered_crossfreq,
             )
+
+def main():
+    # eval_coherence.py is assumed to be inside src/
+    project_root = Path(__file__).resolve().parents[2]
+
+    # ---------------------------------------------------
+    # 1. Paths
+    # ---------------------------------------------------
+    run_dir = (
+        project_root
+        / "Save_TrainedModel"
+        / "ffm_tc_pointcloud_DemoN30_20260610_173403"
+    )
+
+    # This must be the saved tensor file, not the Python script.
+    graph_basis_path = (
+        project_root
+        / "Save_Graph"
+        / "graph_basis_k16_modes384.pt"
+    )
+
+    output_dir = run_dir / "Evaluation" / "BandEnergy"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_name = "best"
+    split = "test"
+
+    # Cross-frequency covariance requires multiple snapshots.
+    num_snapshots = 16
+
+    # Set True to calculate energy after returning to physical units.
+    use_denorm = False
+
+    device = torch.device(
+        "cuda:0" if torch.cuda.is_available() else "cpu"
+    )
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    # ---------------------------------------------------
+    # 2. Load the saved run configuration
+    # ---------------------------------------------------
+    source_cfg = load_source_config(run_dir)
+
+    data_path = Path(
+        source_cfg.get(
+            "data",
+            "Dataset/Merged_CH4COTU1P.h5",
+        )
+    )
+
+    if not data_path.is_absolute():
+        data_path = project_root / data_path
+
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {data_path}"
+        )
+
+    # ---------------------------------------------------
+    # 3. Load dataset using this model's saved statistics
+    # ---------------------------------------------------
+    dataset = TurbulentCombustionH5Dataset(
+        h5_path=str(data_path),
+        split=split,
+        train_ratio=float(source_cfg.get("train_ratio", 0.9)),
+        seed=int(source_cfg.get("seed", 42)),
+        time_stride=int(source_cfg.get("time_stride", 1)),
+        stats_path=str(run_dir / "dataset_stats.pt"),
+    )
+
+    field_names = list(dataset.field_names)
+
+
+    # ---------------------------------------------------
+    # Conditioning configuration
+    # ---------------------------------------------------
+    cond_fields = (
+        source_cfg.get("vis_cond_fields")
+        or source_cfg.get("cond_fields")
+    )
+
+    if cond_fields is None:
+        cond_fields = [int(source_cfg.get("cond_field") or 2)]
+    elif isinstance(cond_fields, (int, np.integer)):
+        cond_fields = [int(cond_fields)]
+    else:
+        cond_fields = [int(v) for v in cond_fields]
+
+
+    n_obs_list = (
+        source_cfg.get("vis_n_obs_list")
+        or source_cfg.get("n_obs_max_list")
+    )
+
+    if n_obs_list is None:
+        n_obs_list = [int(source_cfg.get("n_obs_max") or 256)]
+    elif isinstance(n_obs_list, (int, np.integer)):
+        n_obs_list = [int(n_obs_list)]
+    else:
+        n_obs_list = [int(v) for v in n_obs_list]
+
+
+    # Broadcast one observation count across all conditioned fields.
+    if len(n_obs_list) == 1 and len(cond_fields) > 1:
+        n_obs_list = n_obs_list * len(cond_fields)
+
+    if len(n_obs_list) != len(cond_fields):
+        raise ValueError(
+            "n_obs_list must have length 1 or match cond_fields. "
+            f"Got cond_fields={cond_fields}, n_obs_list={n_obs_list}."
+        )
+
+
+    n_steps_generation = int(
+        source_cfg.get("n_steps_generation") or 100
+    )
+
+    ode_solver = str(
+        source_cfg.get("ode_solver") or "euler"
+    ).lower()
+
+    if ode_solver not in {"euler", "heun"}:
+        raise ValueError(
+            f"Unsupported ode_solver={ode_solver!r}; "
+            "expected 'euler' or 'heun'."
+        )
+
+
+    print(f"Conditioned fields: {cond_fields}")
+    print(f"Observation counts: {n_obs_list}")
+    print(f"Generation steps: {n_steps_generation}")
+    print(f"ODE solver: {ode_solver}")
+
+    # ---------------------------------------------------
+    # 4. Load best.pt
+    # ---------------------------------------------------
+    model, source_cfg_loaded, checkpoint = load_pretrained_ffm(
+    source_run_dir=run_dir,
+    checkpoint=checkpoint_name,
+    dataset=dataset,
+    device=device,
+    )
+
+    model.eval()
+
+    # ---------------------------------------------------
+    # Force PyTorch KNN instead of KeOps
+    # ---------------------------------------------------
+    outer_model = model.module if hasattr(model, "module") else model
+    backbone = outer_model.model
+
+    if not hasattr(backbone, "neighbor_backend"):
+        raise AttributeError(
+            f"Backbone {type(backbone).__name__} does not expose "
+            "neighbor_backend."
+        )
+
+    backbone.neighbor_backend = "torch"
+    backbone.gather_query_chunk_size = 4096
+
+    print(f"Neighbor backend: {backbone.neighbor_backend}")
+    print(
+        "Gather query chunk size: "
+        f"{backbone.gather_query_chunk_size}"
+    )
+
+    print(f"Loaded checkpoint: {run_dir / 'best.pt'}")
+    print(f"Evaluation split: {split}")
+    print(f"Conditioned fields: {cond_fields}")
+    print(f"Observation counts: {n_obs_list}")
+
+    # load_pretrained_ffm rebuilds the model from the saved run
+    # configuration and loads checkpoint['model'] when present.
+    # ---------------------------------------------------
+    # 5. Load graph basis
+    # ---------------------------------------------------
+    if not graph_basis_path.exists():
+        raise FileNotFoundError(
+            f"Graph basis not found: {graph_basis_path}\n"
+            "The graph basis must be a saved .pt file, not a .py script."
+        )
+
+    graph_obj = torch.load(
+        graph_basis_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if not isinstance(graph_obj, dict):
+        raise TypeError(
+            "Expected the graph-basis .pt file to contain a dictionary."
+        )
+
+    print(f"Graph basis keys: {list(graph_obj.keys())}")
+
+    U = graph_obj.get("U")
+    if U is None:
+        U = graph_obj.get("eigenvectors")
+    if U is None:
+        U = graph_obj.get("evecs")
+
+    eigenvalues = graph_obj.get("eigenvalues")
+    if eigenvalues is None:
+        eigenvalues = graph_obj.get("evals")
+
+    if U is None:
+        raise KeyError(
+            "Graph basis does not contain U, eigenvectors, or evecs."
+        )
+
+    U = torch.as_tensor(
+        U,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    if U.ndim != 2:
+        raise ValueError(
+            f"Expected U to have shape [N,K], got {tuple(U.shape)}"
+        )
+
+    if U.shape[0] != dataset.num_points:
+        raise ValueError(
+            "Graph basis spatial size does not match the dataset: "
+            f"U has N={U.shape[0]}, while the dataset has "
+            f"N={dataset.num_points}."
+        )
+
+    # Use saved bands when the graph-basis file contains them.
+    saved_bands = graph_obj.get("bands")
+
+    if saved_bands is not None:
+        bands = {
+            str(name): torch.as_tensor(
+                indices,
+                dtype=torch.long,
+                device=device,
+            )
+            for name, indices in saved_bands.items()
+        }
+    else:
+        if eigenvalues is None:
+            raise KeyError(
+                "Graph basis has neither saved bands nor eigenvalues."
+            )
+
+        eigenvalues = torch.as_tensor(
+            eigenvalues,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        bands = make_graph_frequency_bands(
+            eigenvalues=eigenvalues,
+            exclude_zero=True,
+            split="thirds",
+        )
+
+        bands = {
+            str(name): torch.as_tensor(
+                indices,
+                dtype=torch.long,
+                device=device,
+            )
+            for name, indices in bands.items()
+        }
+
+    print(f"Graph basis shape: {tuple(U.shape)}")
+    print(
+        "Band sizes:",
+        {
+            name: int(indices.numel())
+            for name, indices in bands.items()
+        },
+    )
+
+    # ---------------------------------------------------
+    # 6. Reconstruct several test snapshots
+    # ---------------------------------------------------
+    fields_true_list = []
+    fields_pred_list = []
+
+    snapshot_count = min(num_snapshots, len(dataset))
+
+    if snapshot_count < 2:
+        raise ValueError(
+            "Cross-frequency band covariance requires at least "
+            "two snapshots."
+        )
+
+    with torch.no_grad():
+        for snapshot_index in range(snapshot_count):
+            print(
+                f"Reconstructing snapshot "
+                f"{snapshot_index + 1}/{snapshot_count}"
+            )
+
+            result = reconstruct_snapshot(
+                model=model,
+                dataset=dataset,
+                device=device,
+                snapshot_index=snapshot_index,
+                cond_fields=cond_fields,
+                n_obs_list=n_obs_list,
+                n_steps=n_steps_generation,
+                ode_solver=ode_solver,
+            )
+
+            # Each one is [1,N,C].
+            fields_true_list.append(
+                result["truth"].detach().cpu()
+            )
+            fields_pred_list.append(
+                result["recon"].detach().cpu()
+            )
+
+    # Final shape: [B,N,C].
+    fields_true = torch.cat(
+        fields_true_list,
+        dim=0,
+    ).to(device)
+
+    fields_pred = torch.cat(
+        fields_pred_list,
+        dim=0,
+    ).to(device)
+
+    print(f"fields_true: {tuple(fields_true.shape)}")
+    print(f"fields_pred: {tuple(fields_pred.shape)}")
+
+    # reconstruct_snapshot returns normalized full-field tensors.
+    # ---------------------------------------------------
+    # 7. Optional denormalization
+    # ---------------------------------------------------
+    if use_denorm:
+        mean = dataset.mean.to(
+            device=device,
+            dtype=fields_true.dtype,
+        ).view(1, 1, -1)
+
+        std = dataset.std.to(
+            device=device,
+            dtype=fields_true.dtype,
+        ).view(1, 1, -1)
+
+        fields_true = fields_true * std + mean
+        fields_pred = fields_pred * std + mean
+
+    # ---------------------------------------------------
+    # 8. Compute same- and cross-frequency band energy
+    # ---------------------------------------------------
+    with torch.no_grad():
+        metrics, payload = _cross_spectral_coherence_band_metrics(
+            fields_true=fields_true,
+            fields_pred=fields_pred,
+            U=U,
+            bands=bands,
+            field_pairs=None,  # all c1 < c2 physical-field pairs
+            eps=1e-12,
+        )
+
+    # ---------------------------------------------------
+    # 9. Save both categories of plots
+    # ---------------------------------------------------
+    save_band_energy_diagnostic_plots(
+        payload=payload,
+        save_dir=output_dir,
+        field_names=field_names,
+        save_per_pair=True,
+        unordered_crossfreq=False,
+    )
+
+    # ---------------------------------------------------
+    # 10. Save numerical results
+    # ---------------------------------------------------
+    with open(
+        output_dir / "band_energy_metrics.json",
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(metrics, handle, indent=2)
+
+    np.savez_compressed(
+        output_dir / "band_energy_payload.npz",
+        **payload,
+    )
+
+    metadata = {
+        "run_dir": str(run_dir),
+        "checkpoint": checkpoint_name,
+        "graph_basis_path": str(graph_basis_path),
+        "split": split,
+        "num_snapshots": snapshot_count,
+        "snapshot_indices": list(range(snapshot_count)),
+        "cond_fields": (
+            list(cond_fields)
+            if isinstance(cond_fields, (list, tuple))
+            else [int(cond_fields)]
+        ),
+        "n_obs_list": (
+            list(n_obs_list)
+            if isinstance(n_obs_list, (list, tuple))
+            else [int(n_obs_list)]
+        ),
+        "n_steps_generation": n_steps_generation,
+        "ode_solver": ode_solver,
+        "use_denorm": use_denorm,
+        "field_names": field_names,
+    }
+
+    with open(
+        output_dir / "band_energy_metadata.json",
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(metadata, handle, indent=2)
+
+    print("\nBand-energy plots complete.")
+    print(f"Saved to: {output_dir}")
+
+    print("\nMetrics:")
+    for key, value in metrics.items():
+        print(f"  {key}: {value:.6e}")
+
+
+if __name__ == "__main__":
+    main()
