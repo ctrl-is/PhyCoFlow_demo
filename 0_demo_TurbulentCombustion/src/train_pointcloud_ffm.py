@@ -71,6 +71,8 @@ def parse_args():
                    default=f"Save_TrainedModel/ffm_tc_pointcloud")
     p.add_argument("--RELOAD", action="store_true",
                    help="If set, try to reload the latest matching checkpoint and continue training.")
+    p.add_argument("--reload-checkpoint", dest="reload_checkpoint", type=str, default="last",
+                    choices=["last", "best"], help="Checkpoint used when RELOAD is enabled.")
     p.add_argument("--training-mode", dest="training_mode", type=str, default="standard",
                    choices=["standard", "direct_coherence"])
     p.add_argument("--initialization", type=str, default="scratch", choices=["scratch", "pretrained"])
@@ -277,6 +279,20 @@ def parse_args():
     # ----------------------------------------------------------
     p.add_argument("--direct-coherence-enabled", dest="direct_coherence_enabled",
                    action=argparse.BooleanOptionalAction, default=False)
+    # Cross-Spectral Coherence
+    p.add_argument("--direct-coherence-type", dest="direct_coherence_type", type=str,
+                    default="global_distribution", choices=["global_distribution", "cross_spectral"])
+    p.add_argument("--coherence-graph-basis-path", dest="coherence_graph_basis_path",
+                    type=str, default=None)
+    p.add_argument("--coherence-samefreq-weight", dest="coherence_samefreq_weight", 
+                    type=float, default=1.0)
+    p.add_argument("--coherence-crossfreq-weight", dest="coherence_crossfreq_weight",
+                    type=float, default=1.0)
+    p.add_argument("--coherence-field-pairs", dest="coherence_field_pairs",
+                    type=json.loads, default=None)
+    p.add_argument("--coherence-eps", dest="coherence_eps",
+                    type=float, default=1.0e-8)
+
     p.add_argument("--data-loss-weight", dest="data_loss_weight", type=float, default=1.0)
     p.add_argument("--coherence-loss-weight", dest="coherence_loss_weight", type=float, default=0.1)
     p.add_argument("--coherence-start-epoch", dest="coherence_start_epoch", type=int, default=1)
@@ -573,6 +589,124 @@ def build_direct_coherence_config(args) -> DirectCoherenceConfig:
         use_denorm=bool(args.coherence_use_denorm),
     )
 
+def build_direct_cross_spectral_config(args):
+    from cross_spectral.direct_cross_spectral_loss import (
+        DirectCrossSpectralConfig,
+    )
+    return DirectCrossSpectralConfig(
+        enabled=bool(args.direct_coherence_enabled),
+        samefreq_weight=float(args.coherence_samefreq_weight),
+        crossfreq_weight=float(args.coherence_crossfreq_weight),
+        band_energy_weight=0.0,
+        field_pairs=args.coherence_field_pairs,
+        use_denorm=bool(args.coherence_use_denorm),
+        eps=float(args.coherence_eps),
+    )
+
+
+def resolve_demo_relative_path(
+    demo_dir: str,
+    path_value: str,
+) -> Path:
+    if path_value in (None, ""):
+        raise ValueError(
+            "A graph-basis path is required for cross-spectral coherence."
+        )
+
+    path = Path(path_value)
+
+    if not path.is_absolute():
+        path = Path(demo_dir) / path
+
+    return path
+
+
+def validate_graph_basis_matches_dataset(
+    graph_basis_path: Path,
+    dataset,
+) -> None:
+    """
+    Ensure that graph-basis row i corresponds to dataset node i.
+
+    Matching only the number of nodes is insufficient: a different node
+    ordering would silently produce meaningless graph Fourier coefficients.
+    """
+    graph_obj = torch.load(
+        graph_basis_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if not isinstance(graph_obj, dict):
+        raise TypeError(
+            "Expected the graph-basis file to contain a dictionary."
+        )
+
+    if "U" not in graph_obj:
+        raise KeyError(
+            "Graph-basis file is missing key 'U'."
+        )
+
+    U = torch.as_tensor(
+        graph_obj["U"],
+        dtype=torch.float32,
+    )
+
+    if U.ndim != 2:
+        raise ValueError(
+            f"Expected U with shape [N,K], got {tuple(U.shape)}."
+        )
+
+    if U.shape[0] != int(dataset.num_points):
+        raise ValueError(
+            "Graph-basis/dataset node-count mismatch: "
+            f"U has {U.shape[0]} nodes, while the dataset has "
+            f"{dataset.num_points} nodes."
+        )
+
+    if "coords" not in graph_obj:
+        raise KeyError(
+            "Graph-basis file does not contain 'coords'. "
+            "Cannot verify graph/dataset node ordering."
+        )
+
+    graph_coords = torch.as_tensor(
+        graph_obj["coords"],
+        dtype=torch.float32,
+    )
+
+    dataset_coords = dataset.coords.detach().cpu().float()
+
+    if graph_coords.shape != dataset_coords.shape:
+        raise ValueError(
+            "Graph coordinate shape does not match dataset coordinates: "
+            f"{tuple(graph_coords.shape)} versus "
+            f"{tuple(dataset_coords.shape)}."
+        )
+
+    max_abs_difference = float(
+        torch.max(
+            torch.abs(graph_coords - dataset_coords)
+        ).item()
+    )
+
+    if not torch.allclose(
+        graph_coords,
+        dataset_coords,
+        atol=1.0e-6,
+        rtol=1.0e-5,
+    ):
+        raise ValueError(
+            "The graph basis and current dataset do not use the same "
+            "normalized coordinates/node ordering. "
+            f"Maximum absolute coordinate difference: "
+            f"{max_abs_difference:.6e}"
+        )
+
+    print(
+        "[direct-csc] Graph coordinates match the dataset. "
+        f"Maximum absolute difference: {max_abs_difference:.6e}"
+    )
 
 def current_coherence_loss_weight(args, epoch: int) -> float:
     base = float(args.coherence_loss_weight)
@@ -643,7 +777,8 @@ def run_epoch_direct_coherence(
     query_sample_near_ratio: float,
     query_sample_far_ratio: float,
     query_sample_sigma_ratio: float,
-    direct_cfg: DirectCoherenceConfig,
+    direct_cfg,
+    loss_module: nn.Module,
     args,
     global_step: int,
     epoch: int,
@@ -651,25 +786,51 @@ def run_epoch_direct_coherence(
     std: Optional[torch.Tensor] = None,
 ) -> tuple[dict, int]:
     model.train(True)
-    loss_module = DirectGlobalCoherenceLoss(direct_cfg)
+
+    is_csc = (
+        str(args.direct_coherence_type)
+        .strip()
+        .lower()
+        == "cross_spectral"
+    )
+
     rows = []
     applied = 0
     conflict_count = 0
-    mode_str = "DirectCoherence"
-    pbar = tqdm(loader, desc=f"Epoch {epoch:04d} [{mode_str}]", leave=False)
+
+    mode_str = (
+        "DirectCSC"
+        if is_csc
+        else "DirectGlobalCoherence"
+    )
+
+    pbar = tqdm(
+        loader,
+        desc=f"Epoch {epoch:04d} [{mode_str}]",
+        leave=False,
+    )
 
     for batch in pbar:
         coords_full = batch["coords"].to(device)
         fields_full = batch["fields"].to(device)
-        obs_coords, obs_values, obs_mask, obs_indices, obs_field_ids = build_sparse_condition(
-            coords_full=coords_full,
-            fields_full=fields_full,
-            cond_fields=cond_fields,
-            n_obs_min=n_obs_min_list,
-            n_obs_max=n_obs_max_list,
+
+        obs_coords, obs_values, obs_mask, obs_indices, obs_field_ids = (
+            build_sparse_condition(
+                coords_full=coords_full,
+                fields_full=fields_full,
+                cond_fields=cond_fields,
+                n_obs_min=n_obs_min_list,
+                n_obs_max=n_obs_max_list,
+            )
         )
 
-        effective_n_query = None if getattr(model, "requires_full_grid", False) else n_query_points
+        # Ordinary RF data loss may continue using sampled query points.
+        effective_n_query = (
+            None
+            if getattr(model, "requires_full_grid", False)
+            else n_query_points
+        )
+
         coords_q, fields_q, _ = sample_query_subset(
             coords=coords_full,
             fields=fields_full,
@@ -681,6 +842,7 @@ def run_epoch_direct_coherence(
             far_ratio=query_sample_far_ratio,
             sigma_ratio=query_sample_sigma_ratio,
         )
+
         data_loss, _ = model.training_loss(
             x1=fields_q,
             coords=coords_q,
@@ -692,21 +854,49 @@ def run_epoch_direct_coherence(
         )
 
         global_step += 1
-        every = max(1, int(args.coherence_every_n_steps))
-        coherence_weight = current_coherence_loss_weight(args, epoch)
+
+        every = max(
+            1,
+            int(args.coherence_every_n_steps),
+        )
+
+        coherence_weight = current_coherence_loss_weight(
+            args,
+            epoch,
+        )
+
+        current_batch_size = int(coords_full.shape[0])
+
+        # CSC requires at least two snapshots. For a final one-item batch,
+        # perform only the RF data update rather than crashing.
+        enough_samples = (
+            not is_csc
+            or current_batch_size >= 2
+        )
+
         coherence_active = (
             bool(direct_cfg.enabled)
             and int(epoch) >= int(args.coherence_start_epoch)
             and global_step % every == 0
             and coherence_weight > 0.0
+            and enough_samples
         )
 
         row = {
-            "data_loss": float(data_loss.detach().cpu()),
+            "data_loss": float(
+                data_loss.detach().cpu()
+            ),
             "coherence_loss": float("nan"),
+
+            # Global-distribution components.
             "coherence_self": float("nan"),
             "coherence_mutual": float("nan"),
             "coherence_cross": float("nan"),
+
+            # CSC components.
+            "coherence_samefreq": float("nan"),
+            "coherence_crossfreq": float("nan"),
+
             "coherence_applied": 0.0,
             "data_grad_norm": float("nan"),
             "coherence_grad_norm": float("nan"),
@@ -717,32 +907,101 @@ def run_epoch_direct_coherence(
 
         if not coherence_active:
             optimizer.zero_grad(set_to_none=True)
-            total_loss = float(args.data_loss_weight) * data_loss
+
+            total_loss = (
+                float(args.data_loss_weight)
+                * data_loss
+            )
+
             total_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0,
+            )
+
             row["data_grad_norm"] = _grad_norm(model)
+
             optimizer.step()
-            row["total_loss"] = float(total_loss.detach().cpu())
+
+            row["total_loss"] = float(
+                total_loss.detach().cpu()
+            )
+
         else:
             bsz = coords_full.shape[0]
-            cbsz = min(max(1, int(args.coherence_batch_size)), bsz)
-            sel = torch.randperm(bsz, device=device)[:cbsz].sort().values
 
-            coords_c = coords_full.index_select(0, sel)
-            fields_c = fields_full.index_select(0, sel)
-            obs_coords_c = obs_coords.index_select(0, sel)
-            obs_values_c = obs_values.index_select(0, sel)
-            obs_mask_c = obs_mask.index_select(0, sel)
-            obs_field_ids_c = obs_field_ids.index_select(0, sel)
-            obs_indices_c = obs_indices.index_select(0, sel) if obs_indices is not None else None
+            cbsz = min(
+                max(2 if is_csc else 1, int(args.coherence_batch_size)),
+                bsz,
+            )
 
-            if getattr(model, "requires_full_grid", False) or not bool(args.coherence_downsample):
-                coords_coh, fields_ref, _ = coords_c, fields_c, None
+            sel = (
+                torch.randperm(
+                    bsz,
+                    device=device,
+                )[:cbsz]
+                .sort()
+                .values
+            )
+
+            coords_c = coords_full.index_select(
+                0,
+                sel,
+            )
+
+            fields_c = fields_full.index_select(
+                0,
+                sel,
+            )
+
+            obs_coords_c = obs_coords.index_select(
+                0,
+                sel,
+            )
+
+            obs_values_c = obs_values.index_select(
+                0,
+                sel,
+            )
+
+            obs_mask_c = obs_mask.index_select(
+                0,
+                sel,
+            )
+
+            obs_field_ids_c = obs_field_ids.index_select(
+                0,
+                sel,
+            )
+
+            obs_indices_c = (
+                obs_indices.index_select(0, sel)
+                if obs_indices is not None
+                else None
+            )
+
+            # CSC must preserve all 40,300 nodes because U has one row per
+            # complete spatial node.
+            if (
+                getattr(model, "requires_full_grid", False)
+                or not bool(args.coherence_downsample)
+            ):
+                coords_coh = coords_c
+                fields_ref = fields_c
             else:
-                coords_coh, fields_ref, _ = sample_coherence_points(
-                    coords=coords_c,
-                    fields=fields_c,
-                    n_points=args.coherence_n_points,
+                coords_coh, fields_ref, _ = (
+                    sample_coherence_points(
+                        coords=coords_c,
+                        fields=fields_c,
+                        n_points=args.coherence_n_points,
+                    )
+                )
+
+            if is_csc and coords_coh.shape[1] != fields_full.shape[1]:
+                raise ValueError(
+                    "Cross-spectral coherence received a spatially "
+                    "downsampled field. Set coherence_downsample=false."
                 )
 
             x_gen = differentiable_rf_rollout(
@@ -755,21 +1014,37 @@ def run_epoch_direct_coherence(
                 obs_indices=obs_indices_c,
                 n_steps=args.coherence_rollout_steps,
                 ode_solver=args.coherence_rollout_solver,
-                obs_consistency_mode=args.coherence_obs_consistency_mode,
-                obs_consistency_strength=args.coherence_obs_consistency_strength,
-                obs_consistency_sigma=args.coherence_obs_consistency_sigma,
-                obs_consistency_schedule_power=args.coherence_obs_consistency_schedule_power,
-                obs_consistency_final_clamp=args.coherence_obs_consistency_final_clamp,
+                obs_consistency_mode=(
+                    args.coherence_obs_consistency_mode
+                ),
+                obs_consistency_strength=(
+                    args.coherence_obs_consistency_strength
+                ),
+                obs_consistency_sigma=(
+                    args.coherence_obs_consistency_sigma
+                ),
+                obs_consistency_schedule_power=(
+                    args.coherence_obs_consistency_schedule_power
+                ),
+                obs_consistency_final_clamp=(
+                    args.coherence_obs_consistency_final_clamp
+                ),
             )
+
             coherence_loss_raw, components = loss_module(
                 x_gen=x_gen,
                 x_ref=fields_ref,
                 mean=mean,
                 std=std,
             )
+
             coherence_loss_for_update = coherence_loss_raw
+
             if bool(args.coherence_interval_rescale):
-                coherence_loss_for_update = coherence_loss_for_update * every
+                coherence_loss_for_update = (
+                    coherence_loss_for_update
+                    * every
+                )
 
             grad_info = apply_two_objective_update(
                 model=model,
@@ -777,48 +1052,193 @@ def run_epoch_direct_coherence(
                 data_loss=data_loss,
                 coherence_loss=coherence_loss_for_update,
                 mode=args.gradient_balance_mode,
-                data_weight=float(args.data_loss_weight) if args.gradient_balance_mode == "weighted_sum" else float(args.config_data_grad_scale),
-                coherence_weight=coherence_weight if args.gradient_balance_mode == "weighted_sum" else float(args.config_coherence_grad_scale),
+                data_weight=(
+                    float(args.data_loss_weight)
+                    if args.gradient_balance_mode
+                    == "weighted_sum"
+                    else float(args.config_data_grad_scale)
+                ),
+                coherence_weight=(
+                    coherence_weight
+                    if args.gradient_balance_mode
+                    == "weighted_sum"
+                    else float(
+                        args.config_coherence_grad_scale
+                    )
+                ),
                 grad_clip_norm=1.0,
-                config_missing_behavior=args.config_missing_behavior,
+                config_missing_behavior=(
+                    args.config_missing_behavior
+                ),
             )
+
             applied += 1
-            if bool(grad_info.get("gradient_conflict", False)):
+
+            if bool(
+                grad_info.get(
+                    "gradient_conflict",
+                    False,
+                )
+            ):
                 conflict_count += 1
-            total_for_log = float(args.data_loss_weight) * data_loss.detach() + coherence_weight * coherence_loss_for_update.detach()
-            row.update({
-                "total_loss": float(total_for_log.cpu()),
-                "coherence_loss": float(coherence_loss_raw.detach().cpu()),
-                "coherence_self": float(components["self_loss"].detach().cpu()),
-                "coherence_mutual": float(components["mutual_loss"].detach().cpu()),
-                "coherence_cross": float(components["cross_loss"].detach().cpu()),
-                "coherence_applied": 1.0,
-                "data_grad_norm": float(grad_info.get("data_grad_norm", float("nan"))),
-                "coherence_grad_norm": float(grad_info.get("coherence_grad_norm", float("nan"))),
-                "gradient_cosine": float(grad_info.get("gradient_cosine", float("nan"))),
-                "gradient_conflict": 1.0 if bool(grad_info.get("gradient_conflict", False)) else 0.0,
-            })
+
+            total_for_log = (
+                float(args.data_loss_weight)
+                * data_loss.detach()
+                + coherence_weight
+                * coherence_loss_for_update.detach()
+            )
+
+            row.update(
+                {
+                    "total_loss": float(
+                        total_for_log.cpu()
+                    ),
+                    "coherence_loss": float(
+                        coherence_loss_raw
+                        .detach()
+                        .cpu()
+                    ),
+                    "coherence_applied": 1.0,
+                    "data_grad_norm": float(
+                        grad_info.get(
+                            "data_grad_norm",
+                            float("nan"),
+                        )
+                    ),
+                    "coherence_grad_norm": float(
+                        grad_info.get(
+                            "coherence_grad_norm",
+                            float("nan"),
+                        )
+                    ),
+                    "gradient_cosine": float(
+                        grad_info.get(
+                            "gradient_cosine",
+                            float("nan"),
+                        )
+                    ),
+                    "gradient_conflict": (
+                        1.0
+                        if bool(
+                            grad_info.get(
+                                "gradient_conflict",
+                                False,
+                            )
+                        )
+                        else 0.0
+                    ),
+                }
+            )
+
+            if is_csc:
+                row["coherence_samefreq"] = float(
+                    components["samefreq_loss"]
+                    .detach()
+                    .cpu()
+                )
+
+                row["coherence_crossfreq"] = float(
+                    components["crossfreq_loss"]
+                    .detach()
+                    .cpu()
+                )
+
+            else:
+                row["coherence_self"] = float(
+                    components["self_loss"]
+                    .detach()
+                    .cpu()
+                )
+
+                row["coherence_mutual"] = float(
+                    components["mutual_loss"]
+                    .detach()
+                    .cpu()
+                )
+
+                row["coherence_cross"] = float(
+                    components["cross_loss"]
+                    .detach()
+                    .cpu()
+                )
 
         rows.append(row)
-        pbar.set_postfix_str(
-            f"data={row['data_loss']:.3e} coh={row['coherence_loss']:.3e} applied={int(row['coherence_applied'])}"
-        )
+
+        if is_csc:
+            pbar.set_postfix_str(
+                f"data={row['data_loss']:.3e} "
+                f"csc={row['coherence_loss']:.3e} "
+                f"same={row['coherence_samefreq']:.3e} "
+                f"xfreq={row['coherence_crossfreq']:.3e} "
+                f"applied={int(row['coherence_applied'])}"
+            )
+        else:
+            pbar.set_postfix_str(
+                f"data={row['data_loss']:.3e} "
+                f"coh={row['coherence_loss']:.3e} "
+                f"applied={int(row['coherence_applied'])}"
+            )
 
     count = max(len(rows), 1)
+
     metrics = {
-        "total_loss": _mean_metric(rows, "total_loss"),
-        "data_loss": _mean_metric(rows, "data_loss"),
-        "coherence_loss": _mean_metric(rows, "coherence_loss"),
-        "coherence_self": _mean_metric(rows, "coherence_self"),
-        "coherence_mutual": _mean_metric(rows, "coherence_mutual"),
-        "coherence_cross": _mean_metric(rows, "coherence_cross"),
-        "coherence_application_fraction": float(applied / count),
-        "data_grad_norm": _mean_metric(rows, "data_grad_norm"),
-        "coherence_grad_norm": _mean_metric(rows, "coherence_grad_norm"),
-        "gradient_cosine": _mean_metric(rows, "gradient_cosine"),
-        "gradient_conflict_fraction": float(conflict_count / max(applied, 1)),
+        "total_loss": _mean_metric(
+            rows,
+            "total_loss",
+        ),
+        "data_loss": _mean_metric(
+            rows,
+            "data_loss",
+        ),
+        "coherence_loss": _mean_metric(
+            rows,
+            "coherence_loss",
+        ),
+
+        "coherence_self": _mean_metric(
+            rows,
+            "coherence_self",
+        ),
+        "coherence_mutual": _mean_metric(
+            rows,
+            "coherence_mutual",
+        ),
+        "coherence_cross": _mean_metric(
+            rows,
+            "coherence_cross",
+        ),
+
+        "coherence_samefreq": _mean_metric(
+            rows,
+            "coherence_samefreq",
+        ),
+        "coherence_crossfreq": _mean_metric(
+            rows,
+            "coherence_crossfreq",
+        ),
+
+        "coherence_application_fraction": float(
+            applied / count
+        ),
+        "data_grad_norm": _mean_metric(
+            rows,
+            "data_grad_norm",
+        ),
+        "coherence_grad_norm": _mean_metric(
+            rows,
+            "coherence_grad_norm",
+        ),
+        "gradient_cosine": _mean_metric(
+            rows,
+            "gradient_cosine",
+        ),
+        "gradient_conflict_fraction": float(
+            conflict_count / max(applied, 1)
+        ),
         "global_step": float(global_step),
     }
+
     return metrics, global_step
 
 
@@ -950,9 +1370,14 @@ class DirectCoherenceHistoryLogger:
             "train_total_loss",
             "train_data_loss",
             "train_coherence_loss",
+
             "coherence_self",
             "coherence_mutual",
             "coherence_cross",
+
+            "coherence_samefreq",
+            "coherence_crossfreq",
+
             "coherence_application_fraction",
             "data_grad_norm",
             "coherence_grad_norm",
@@ -981,6 +1406,8 @@ class DirectCoherenceHistoryLogger:
             "gradient_conflict_fraction": metrics.get("gradient_conflict_fraction", float("nan")),
             "lr": float(lr),
             "global_step": int(global_step),
+            "coherence_samefreq": metrics.get("coherence_samefreq", float("nan")),
+            "coherence_crossfreq": metrics.get("coherence_crossfreq", float("nan")),
         }
         self.rows.append(row)
         with open(self.csv_path, "a", encoding="utf-8", newline="") as handle:
@@ -1026,10 +1453,13 @@ class DirectCoherenceHistoryLogger:
             axes[0].legend()
 
         right_specs = [
+            ("coherence_samefreq", "Same-frequency", "#d62728"),
+            ("coherence_crossfreq", "Cross-frequency", "#1f77b4"),
             ("coherence_self", "Self", "#9467bd"),
-            ("coherence_mutual", "Mutual", "#ff7f0e"),
-            ("coherence_cross", "Cross", "#17becf"),
+            ("coherence_mutual", "Mutual","#ff7f0e"),
+            ("coherence_cross", "Global cross", "#17becf"),
         ]
+
         for key, label, color in right_specs:
             xs, ys = self._series(self.rows, key)
             if xs:
@@ -1168,9 +1598,17 @@ def apply_pretrained_source_base_config(args, source_run_dir: Optional[Path]) ->
     return inherited
 
 
-def checkpoint_metadata(args, direct_cfg: Optional[DirectCoherenceConfig], source_run_dir, source_checkpoint) -> dict:
+def checkpoint_metadata(
+    args,
+    direct_cfg: Optional[object],
+    source_run_dir,
+    source_checkpoint,
+) -> dict:
     if str(args.training_mode) == "direct_coherence":
-        method = "direct_coherence_rectified_flow"
+        method = (
+            f"direct_{args.direct_coherence_type}"
+            "_rectified_flow"
+        )
     else:
         method = "1_rectified_flow"
     return {
@@ -1185,6 +1623,7 @@ def checkpoint_metadata(args, direct_cfg: Optional[DirectCoherenceConfig], sourc
         "coherence_config": None if direct_cfg is None else direct_cfg.to_dict(),
         "pretrained_use_source_base_config": bool(getattr(args, "pretrained_use_source_base_config", True)),
         "pretrained_inherited_base_config_keys": list(getattr(args, "pretrained_inherited_base_config_keys", [])),
+        "direct_coherence_type": getattr(args, "direct_coherence_type", None),
     }
 
 
@@ -1278,20 +1717,105 @@ def main():
     save_dir = Path(os.path.join(demo_dir, args.save_dir + f"_DemoN{args.Demo_Num}" + f"_{timestamp}"))
 
     if args.RELOAD:
-        latest_run_dir = find_latest_run_dir(demo_dir=demo_dir, save_dir=args.save_dir, demo_num=args.Demo_Num)
-        if latest_run_dir is not None and (latest_run_dir / "best.pt").exists():
-            save_dir = latest_run_dir
-            run_timestamp = extract_run_timestamp(latest_run_dir, args.save_dir, args.Demo_Num)
-            reload_ckpt = torch.load(latest_run_dir / "best.pt", map_location="cpu", weights_only=False)
-            start_epoch = int(reload_ckpt.get("epoch", 0)) + 1
-            best_val = float(reload_ckpt.get("val_loss", float("inf")))
-            global_step = int(reload_ckpt.get("global_step", 0))
+        latest_run_dir = find_latest_run_dir(
+            demo_dir=demo_dir,
+            save_dir=args.save_dir,
+            demo_num=args.Demo_Num,
+        )
 
-            backup_existing_artifact(latest_run_dir / "best.pt")
-            print(f"[*] RELOAD=True, resuming from: {latest_run_dir / 'best.pt'}")
-            print(f"[*] Resume will start from epoch {start_epoch}\n")
+        checkpoint_name = (
+            str(args.reload_checkpoint)
+            .strip()
+            .lower()
+        )
+
+        reload_path = (
+            None
+            if latest_run_dir is None
+            else latest_run_dir / f"{checkpoint_name}.pt"
+        )
+
+        if (
+            latest_run_dir is not None
+            and reload_path is not None
+            and reload_path.exists()
+        ):
+            save_dir = latest_run_dir
+
+            run_timestamp = extract_run_timestamp(
+                latest_run_dir,
+                args.save_dir,
+                args.Demo_Num,
+            )
+
+            reload_ckpt = torch.load(
+                reload_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+
+            start_epoch = int(
+                reload_ckpt.get("epoch", 0)
+            ) + 1
+
+            global_step = int(
+                reload_ckpt.get("global_step", 0)
+            )
+
+            # Preserve the true historical best validation loss even though
+            # training resumes from last.pt.
+            best_path = latest_run_dir / "best.pt"
+
+            if best_path.exists():
+                best_ckpt = torch.load(
+                    best_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+
+                best_val = float(
+                    best_ckpt.get(
+                        "val_loss",
+                        float("inf"),
+                    )
+                )
+            else:
+                best_val = float(
+                    reload_ckpt.get(
+                        "val_loss",
+                        float("inf"),
+                    )
+                )
+
+            # Preserve the original checkpoint before continuing.
+            backup_existing_artifact(reload_path)
+
+            print(
+                f"[*] RELOAD=True, resuming from: "
+                f"{reload_path}"
+            )
+
+            print(
+                f"[*] Resume will start from epoch "
+                f"{start_epoch}"
+            )
+
+            print(
+                f"[*] Historical best validation loss: "
+                f"{best_val:.6e}\n"
+            )
+
         else:
-            print("[*] RELOAD=True, but no matching best.pt was found. Training will start from scratch.\n")
+            expected_path = (
+                f"{latest_run_dir}/{checkpoint_name}.pt"
+                if latest_run_dir is not None
+                else "no matching run directory"
+            )
+
+            raise FileNotFoundError(
+                "RELOAD=True, but the requested checkpoint "
+                f"was not found: {expected_path}"
+            )
 
     source_run_dir, source_checkpoint = resolve_pretrained_checkpoint(demo_dir, args)
     if source_checkpoint is not None:
@@ -1339,8 +1863,13 @@ def main():
 
     # Initialize helpers
     logger = TrainingHistoryLogger(save_dir)
-    direct_cfg = build_direct_coherence_config(args)
-    direct_logger = DirectCoherenceHistoryLogger(save_dir) if args.training_mode == "direct_coherence" else None
+    direct_cfg = None
+    direct_loss_module = None
+    direct_logger = (
+        DirectCoherenceHistoryLogger(save_dir)
+        if args.training_mode == "direct_coherence"
+        else None
+    )
     recon_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"[*] Model checkpoints will save to: {save_dir}")
@@ -1367,6 +1896,82 @@ def main():
         time_stride=args.time_stride,
         stats_path=str(save_dir / "dataset_stats.pt"),
     )
+    if args.training_mode == "direct_coherence":
+        coherence_type = (
+            str(args.direct_coherence_type)
+            .strip()
+            .lower()
+        )
+
+        if coherence_type == "cross_spectral":
+            from cross_spectral.direct_cross_spectral_loss import (
+                build_direct_cross_spectral_loss,
+            )
+            direct_cfg = (
+                build_direct_cross_spectral_config(args)
+            )
+
+            graph_basis_path = resolve_demo_relative_path(
+                demo_dir=demo_dir,
+                path_value=args.coherence_graph_basis_path,
+            )
+
+            if not graph_basis_path.exists():
+                raise FileNotFoundError(
+                    f"CSC graph basis not found: "
+                    f"{graph_basis_path}"
+                )
+
+            validate_graph_basis_matches_dataset(
+                graph_basis_path=graph_basis_path,
+                dataset=train_set,
+            )
+
+            direct_loss_module = (
+                build_direct_cross_spectral_loss(
+                    cfg=direct_cfg,
+                    graph_basis_path=graph_basis_path,
+                    device=device,
+                )
+            )
+
+            print(
+                "[*] Direct coherence objective: "
+                "cross-spectral"
+            )
+            print(
+                "[*] CSC graph basis: "
+                f"{graph_basis_path}"
+            )
+            print(
+                "[*] CSC weights: "
+                f"same-frequency="
+                f"{args.coherence_samefreq_weight}, "
+                f"cross-frequency="
+                f"{args.coherence_crossfreq_weight}"
+            )
+
+        elif coherence_type == "global_distribution":
+            direct_cfg = build_direct_coherence_config(
+                args
+            )
+
+            direct_loss_module = (
+                DirectGlobalCoherenceLoss(
+                    direct_cfg
+                ).to(device)
+            )
+
+            print(
+                "[*] Direct coherence objective: "
+                "global distribution"
+            )
+
+        else:
+            raise ValueError(
+                "Unsupported direct_coherence_type: "
+                f"{args.direct_coherence_type!r}"
+            )
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -1567,37 +2172,113 @@ def main():
     print(f'\nSelected Backbone: {args.backbone}\n')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     if reload_ckpt is not None:
-        model.load_state_dict(reload_ckpt["model"])
+        model.load_state_dict(
+            reload_ckpt["model"]
+        )
+
         if "optimizer" in reload_ckpt:
-            optimizer.load_state_dict(reload_ckpt["optimizer"])
-        print("[*] Reloaded model state from best.pt")
+            optimizer.load_state_dict(
+                reload_ckpt["optimizer"]
+            )
+
+        print(
+            "[*] Reloaded model and optimizer from "
+            f"{args.reload_checkpoint}.pt"
+        )
+
     elif source_checkpoint is not None:
-        pretrained_ckpt = torch.load(source_checkpoint, map_location="cpu", weights_only=False)
+        pretrained_ckpt = torch.load(
+            source_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+
         pretrained_state = (
             pretrained_ckpt["model"]
-            if isinstance(pretrained_ckpt, dict) and "model" in pretrained_ckpt
+            if isinstance(pretrained_ckpt, dict)
+            and "model" in pretrained_ckpt
             else pretrained_ckpt
         )
+
         try:
-            load_result = model.load_state_dict(pretrained_state, strict=bool(args.pretrained_strict))
+            load_result = model.load_state_dict(
+                pretrained_state,
+                strict=bool(args.pretrained_strict),
+            )
         except RuntimeError as exc:
             raise RuntimeError(
-                "Pretrained checkpoint is architecture-incompatible with the current model. "
-                "Check backbone/hidden dimensions/conditioning architecture or set pretrained_strict=false "
-                "only if the mismatch is intentional."
+                "Pretrained checkpoint is architecture-incompatible "
+                "with the current model. Check backbone/hidden "
+                "dimensions/conditioning architecture or set "
+                "pretrained_strict=false only if the mismatch is "
+                "intentional."
                 f"{architecture_compatibility_hint(args, source_run_dir)}"
             ) from exc
-        if not bool(args.pretrained_strict):
-            print(f"[*] Pretrained load missing keys: {load_result.missing_keys}")
-            print(f"[*] Pretrained load unexpected keys: {load_result.unexpected_keys}")
-        if bool(args.pretrained_load_optimizer) and isinstance(pretrained_ckpt, dict) and "optimizer" in pretrained_ckpt:
-            optimizer.load_state_dict(pretrained_ckpt["optimizer"])
-            print("[*] Loaded optimizer state from pretrained checkpoint")
-        print("[*] Loaded pretrained model state; new run starts at epoch 1")
 
+        if not bool(args.pretrained_strict):
+            print(
+                "[*] Pretrained load missing keys: "
+                f"{load_result.missing_keys}"
+            )
+            print(
+                "[*] Pretrained load unexpected keys: "
+                f"{load_result.unexpected_keys}"
+            )
+
+        if (
+            bool(args.pretrained_load_optimizer)
+            and isinstance(pretrained_ckpt, dict)
+            and "optimizer" in pretrained_ckpt
+        ):
+            optimizer.load_state_dict(
+                pretrained_ckpt["optimizer"]
+            )
+            print(
+                "[*] Loaded optimizer state from "
+                "pretrained checkpoint"
+            )
+
+        print(
+            "[*] Loaded pretrained model state; "
+            "new run starts at epoch 1"
+        )
+    for param_group in optimizer.param_groups:
+        param_group.setdefault(
+            "initial_lr",
+            float(args.lr),
+        )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+    )
+
+    if reload_ckpt is not None:
+        if "scheduler" in reload_ckpt:
+            scheduler.load_state_dict(
+                reload_ckpt["scheduler"]
+            )
+
+            print(
+                "[*] Restored scheduler state from checkpoint"
+            )
+
+        else:
+            completed_epoch = start_epoch - 1
+
+            scheduler.last_epoch = completed_epoch
+            scheduler._step_count = completed_epoch + 1
+            scheduler._last_lr = [
+                group["lr"]
+                for group in optimizer.param_groups
+            ]
+
+            print(
+                "[*] Reconstructed scheduler position for "
+                f"completed epoch {completed_epoch}"
+            )
     for epoch in range(start_epoch, args.epochs + 1):
         if args.training_mode == "direct_coherence":
             epoch_train_loader = build_epoch_train_loader(train_set, args, epoch)
@@ -1615,6 +2296,7 @@ def main():
                 query_sample_far_ratio=args.query_sample_far_ratio,
                 query_sample_sigma_ratio=args.query_sample_sigma_ratio,
                 direct_cfg=direct_cfg,
+                loss_module=direct_loss_module,
                 args=args,
                 global_step=global_step,
                 epoch=epoch,
@@ -1643,13 +2325,35 @@ def main():
         scheduler.step()
 
         if direct_metrics is not None:
-            print(
-                f"[train] epoch={epoch:04d} total={direct_metrics['total_loss']:.6e} "
-                f"data={direct_metrics['data_loss']:.6e} coherence={direct_metrics['coherence_loss']:.6e} "
-                f"self={direct_metrics['coherence_self']:.3e} mutual={direct_metrics['coherence_mutual']:.3e} "
-                f"cross={direct_metrics['coherence_cross']:.3e} "
-                f"applied={direct_metrics['coherence_application_fraction']:.2%}"
-            )
+            if (
+                str(args.direct_coherence_type)
+                .strip()
+                .lower()
+                == "cross_spectral"
+            ):
+                print(
+                    f"[train] epoch={epoch:04d} "
+                    f"total={direct_metrics['total_loss']:.6e} "
+                    f"data={direct_metrics['data_loss']:.6e} "
+                    f"csc={direct_metrics['coherence_loss']:.6e} "
+                    f"same={direct_metrics['coherence_samefreq']:.3e} "
+                    f"crossfreq={direct_metrics['coherence_crossfreq']:.3e} "
+                    f"applied="
+                    f"{direct_metrics['coherence_application_fraction']:.2%}"
+                )
+            else:
+                print(
+                    f"[train] epoch={epoch:04d} "
+                    f"total={direct_metrics['total_loss']:.6e} "
+                    f"data={direct_metrics['data_loss']:.6e} "
+                    f"coherence={direct_metrics['coherence_loss']:.6e} "
+                    f"self={direct_metrics['coherence_self']:.3e} "
+                    f"mutual={direct_metrics['coherence_mutual']:.3e} "
+                    f"cross={direct_metrics['coherence_cross']:.3e} "
+                    f"applied="
+                    f"{direct_metrics['coherence_application_fraction']:.2%}"
+                )
+
             if direct_logger is not None:
                 direct_logger.log(
                     epoch=epoch,
@@ -1658,7 +2362,11 @@ def main():
                     global_step=global_step,
                 )
         else:
-            print(f"[train] epoch={epoch:04d} loss={tr_loss:.6e}")
+            print(
+                f"[train] epoch={epoch:04d} "
+                f"loss={tr_loss:.6e}"
+            )
+
         val_loss = None
         if epoch % args.eval_every == 0 or epoch == 1:
             with torch.no_grad():
@@ -1682,6 +2390,7 @@ def main():
             ckpt = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
                 "train_loss": tr_loss,
