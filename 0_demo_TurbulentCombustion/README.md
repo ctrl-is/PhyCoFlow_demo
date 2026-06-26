@@ -192,6 +192,51 @@ python src/train_pointcloud_ffm.py \
   --RELOAD
 ```
 
+### 1.7 Direct Coherence Post-Training
+
+Standard point-cloud FFM training still uses the ordinary rectified-flow data
+loss path:
+
+```bash
+python src/train_pointcloud_ffm.py \
+  --config Save_config/config_pointcloud_ffm.yaml \
+  --Demo-Num 19
+```
+
+Direct coherence post-training uses the same training entrypoint, but switches
+to a scheduled differentiable clean rollout before applying global coherence
+losses:
+
+```bash
+python src/train_pointcloud_ffm.py \
+  --config Save_config/config_pointcloud_ffm_direct_posttrain.yaml \
+  --Demo-Num 40
+```
+
+In direct post-training, the model first computes the usual RF velocity MSE on
+the normal query subset. On scheduled steps, it also differentiably rolls out a
+clean sample and compares its empirical field distribution to the reference
+with differentiable self, mutual, and cross coherence terms. `coherence_every_n_steps`
+reduces the expense by running that rollout only every N optimizer steps.
+Post-training writes a live monitor next to the usual `loss_history.*` files:
+`direct_coherence_history.csv`, `direct_coherence_history.json`, and
+`direct_coherence_history.png`. The PNG is refreshed every epoch and shows
+total/data/coherence losses plus the self/mutual/cross physical coherence
+components.
+
+Gradient balancing can use either `weighted_sum` or `config`. ConFIG follows
+the separate-gradient conflict-free update pattern and requires the optional
+package:
+
+```bash
+pip install conflictfree
+```
+
+This direct method requires differentiable coherence terms because gradients
+flow through the terminal rollout and Wasserstein sorting/top-k operations.
+That differs from RAM, where detached scalar coherence rewards are used for
+posterior-style policy fine-tuning.
+
 Evaluate a trained model:
 
 ```bash
@@ -241,12 +286,24 @@ RAM has two implementation modes:
   `default` for the trainable policy, `old` for endpoint sampling and old
   velocity targets, and `evaluation` for validation/checkpoint export. Use
   `finetune_mode: lora_head_glres` as the recommended default for
-  memory-efficient GL_rbf/topk_rbf_glres fine-tuning.
+  memory-efficient GL_rbf/topk_rbf_glres fine-tuning. Use
+  `finetune_mode: lora_all_linear_glrbf` to adapt all linear layers under the
+  GL_rbf model. The LoRA target scope is derived from `finetune_mode`;
+  `lora_target_scope` is optional and must be `null`, `auto`, or match the
+  selected mode.
 
 The RAM algorithm is unchanged in both modes: endpoints are sampled, scalar
 coherence rewards produce group-relative advantages, endpoints are analytically
 re-noised, and the policy is trained against a detached velocity MSE target.
 No reward gradients, SDE rollouts, or adjoint sweeps are used.
+
+RAM separates the raw coherence cost from the reward shaping used for
+fine-tuning. `reward_mode` chooses the lower-is-better raw cost, such as
+`global_dist`, `marginal_only`, or `field_l2`. `reward_transform` then maps
+that cost into scalar rewards before the usual group-relative advantage step.
+`negative_cost` is the historical smooth posterior-tilting behavior. For
+stronger posterior-pruning behavior, use scale-free or thresholded transforms
+such as `group_rank`, `top_bottom`, or `softplus_barrier`.
 
 RAM has additional memory controls beyond the base trainer. Endpoint sampling
 still produces full fields, but reward/coherence and velocity matching can use
@@ -256,6 +313,12 @@ separate point subsets:
   analogous to base `n_query_points`.
 - `ram_reward_n_points`: optional uniform point subset used only for scalar
   reward/coherence. `null` keeps full-grid reward evaluation.
+- `fixed_reward_points_for_eval` / `fixed_reward_points_for_rollout`: reuse a
+  deterministic reward/coherence point subset for comparable validation and
+  rollout curves. Rollout caches the indices under `Rollout/` unless
+  `rollout_reward_point_path` is set.
+- `align_ram_and_rollout_obs_consistency`: when `true`, RAM endpoint sampling
+  uses the same sparse-observation consistency mode as rollout monitoring.
 - `train_ratio_downsample`: fresh random fraction of the training split used in
   each RAM epoch; validation and test sets are unchanged.
 - `ram_query_sampling`: query selection mode, usually `obs_mix` to match base
@@ -267,7 +330,7 @@ separate point subsets:
 - `global_include_pairwise`: pairwise coherence is more expensive; keep it
   `false` for first formal RAM runs and enable it later if needed.
 
-The default RAM config uses `lora_head_glres`, `batch_size: 8`,
+The default RAM config uses `lora_all_linear_glrbf`, `batch_size: 32`,
 `num_samples_per_condition: 8`, `num_loss_targets_per_endpoint: 2`,
 `ram_n_query_points: 1024`, and `ram_reward_n_points: 4096`. If memory is still
 very low, reduce `ram_endpoint_microbatch_size`, `ram_loss_microbatch_size`, or
