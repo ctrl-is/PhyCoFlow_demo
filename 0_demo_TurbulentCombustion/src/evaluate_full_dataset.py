@@ -251,6 +251,9 @@ def _load_checkpoint(path: Path):
 def _load_model_and_config(args: argparse.Namespace):
     demo_root = Path(args.demo_root).resolve()
 
+    # ---------------------------------------------------------
+    # Select the YAML configuration
+    # ---------------------------------------------------------
     if args.ffm_config is not None:
         yaml_path = Path(args.ffm_config).expanduser()
 
@@ -263,26 +266,61 @@ def _load_model_and_config(args: argparse.Namespace):
             raise FileNotFoundError(
                 f"Specified FFM config does not exist: {yaml_path}"
             )
+
     else:
-        cfg_dir = demo_root / "Save_config" / "pointcloud_ffm"
+        cfg_dir = (
+            demo_root
+            / "Save_config"
+            / "pointcloud_ffm"
+        )
+
         yaml_path = _find_latest_yaml(
             cfg_dir,
             args.Demo_Num,
         )
 
-        with open(yaml_path, "r") as f:
-            cfg = yaml.safe_load(f) or {}
-        cfg = _normalize_eval_config(cfg)
+    # ---------------------------------------------------------
+    # Load the selected YAML in either case
+    # ---------------------------------------------------------
+    with open(
+        yaml_path,
+        "r",
+        encoding="utf-8",
+    ) as handle:
+        cfg = yaml.safe_load(handle) or {}
 
-    train_timestamp = _extract_timestamp(yaml_path)
-    if train_timestamp is None:
-        raise RuntimeError(f"Could not parse timestamp from config filename: {yaml_path.name}")
+    cfg = _normalize_eval_config(cfg)
 
-    save_dir_cfg = Path(cfg.get("save_dir", "Save_TrainedModel/ffm_tc_pointcloud"))
-    model_root = demo_root / save_dir_cfg.parent / (
-        f"{save_dir_cfg.name}_DemoN{args.Demo_Num}_{train_timestamp}"
+    train_timestamp = _extract_timestamp(
+        yaml_path
     )
-    ckpt_path = model_root / f"{args.checkpoint}.pt"
+
+    if train_timestamp is None:
+        raise RuntimeError(
+            "Could not parse timestamp from config filename: "
+            f"{yaml_path.name}"
+        )
+
+    save_dir_cfg = Path(
+        cfg.get(
+            "save_dir",
+            "Save_TrainedModel/ffm_tc_pointcloud",
+        )
+    )
+
+    model_root = (
+        demo_root
+        / save_dir_cfg.parent
+        / (
+            f"{save_dir_cfg.name}_DemoN"
+            f"{args.Demo_Num}_{train_timestamp}"
+        )
+    )
+
+    ckpt_path = (
+        model_root
+        / f"{args.checkpoint}.pt"
+    )
 
     if not model_root.exists():
         raise FileNotFoundError(f"Matching model directory not found: {model_root}")
