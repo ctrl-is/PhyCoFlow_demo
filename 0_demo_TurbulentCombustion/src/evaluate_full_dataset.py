@@ -101,6 +101,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--demo-root", type=str, default=".")
     parser.add_argument(
+        "--ffm-config",
+        type=str,
+        default=None,
+        help=(
+            "Specific backed-up FFM YAML configuration. "
+            "If omitted, the latest YAML matching --Demo-Num is used."
+        ),
+    )
+    parser.add_argument(
         "--baseline-model",
         type=str,
         default=None,
@@ -241,12 +250,29 @@ def _load_checkpoint(path: Path):
 
 def _load_model_and_config(args: argparse.Namespace):
     demo_root = Path(args.demo_root).resolve()
-    cfg_dir = demo_root / "Save_config" / "pointcloud_ffm"
-    yaml_path = _find_latest_yaml(cfg_dir, args.Demo_Num)
 
-    with open(yaml_path, "r") as f:
-        cfg = yaml.safe_load(f) or {}
-    cfg = _normalize_eval_config(cfg)
+    if args.ffm_config is not None:
+        yaml_path = Path(args.ffm_config).expanduser()
+
+        if not yaml_path.is_absolute():
+            yaml_path = demo_root / yaml_path
+
+        yaml_path = yaml_path.resolve()
+
+        if not yaml_path.exists():
+            raise FileNotFoundError(
+                f"Specified FFM config does not exist: {yaml_path}"
+            )
+    else:
+        cfg_dir = demo_root / "Save_config" / "pointcloud_ffm"
+        yaml_path = _find_latest_yaml(
+            cfg_dir,
+            args.Demo_Num,
+        )
+
+        with open(yaml_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        cfg = _normalize_eval_config(cfg)
 
     train_timestamp = _extract_timestamp(yaml_path)
     if train_timestamp is None:
